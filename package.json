@@ -1,0 +1,16 @@
+{
+  "name": "nes-platform",
+  "private": true,
+  "version": "0.1.0",
+  "description": "NeS Digital Credits Platform",
+  "workspaces": [
+    "backend"
+  ],
+  "scripts": {
+    "dev:backend": "npm run dev -w backend",
+    "build": "npm run build -w backend",
+    "test": "npm test -w backend",
+    "db:migrate": "npm run prisma:migrate -w backend",
+    "db:generate": "npm run prisma:generate -w backend"
+  }
+}

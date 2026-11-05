@@ -1,0 +1,633 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ───────────────────────── Enums ─────────────────────────
+
+enum Role {
+  USER
+  DEVELOPER
+  MERCHANT
+  ADMIN
+  SUPER_ADMIN
+}
+
+enum UserStatus {
+  ACTIVE
+  SUSPENDED
+  DELETED
+}
+
+enum CardStatus {
+  ACTIVE
+  SUSPENDED
+  BLOCKED
+}
+
+enum Environment {
+  SANDBOX
+  PRODUCTION
+}
+
+enum LedgerAccountType {
+  USER_WALLET
+  USER_PENDING
+  MERCHANT_SETTLEMENT
+  PLATFORM_FLOAT      // counterparty for deposits/withdrawals (RWF-backed liability side)
+  PLATFORM_FEES
+  PLATFORM_ADJUSTMENT
+  RESERVE_WITHDRAWAL  // credits held for in-flight withdrawals
+}
+
+enum EntryDirection {
+  DEBIT
+  CREDIT
+}
+
+enum LedgerTxType {
+  DEPOSIT
+  WITHDRAWAL
+  WITHDRAWAL_REVERSAL
+  MERCHANT_PAYMENT
+  REFUND
+  ADJUSTMENT
+  FEE
+}
+
+enum PaymentStatus {
+  PENDING
+  PROCESSING
+  COMPLETED
+  FAILED
+  EXPIRED
+  CANCELLED
+  REVERSED
+}
+
+enum RefundStatus {
+  PENDING
+  COMPLETED
+  FAILED
+}
+
+enum MerchantStatus {
+  PENDING
+  APPROVED
+  REJECTED
+  SUSPENDED
+}
+
+enum AppStatus {
+  ACTIVE
+  SUSPENDED
+  REVOKED
+}
+
+enum ProductionAccessStatus {
+  NONE
+  REQUESTED
+  APPROVED
+  REJECTED
+}
+
+enum ApiKeyStatus {
+  ACTIVE
+  REVOKED
+}
+
+enum WebhookDeliveryStatus {
+  PENDING
+  DELIVERED
+  FAILED
+}
+
+// ───────────────────────── Identity ─────────────────────────
+
+model User {
+  id              String     @id @default(uuid())
+  email           String?    @unique
+  phone           String?    @unique
+  passwordHash    String
+  role            Role       @default(USER)
+  status          UserStatus @default(ACTIVE)
+  emailVerifiedAt DateTime?
+  phoneVerifiedAt DateTime?
+  /// Bump to invalidate every outstanding session JWT (logout, password reset).
+  tokenVersion    Int        @default(0)
+  createdAt       DateTime   @default(now())
+  updatedAt       DateTime   @updatedAt
+
+  authTokens         AuthToken[]
+  profile            UserProfile?
+  card               ReaderCard?
+  wallet             Wallet?
+  developer          Developer?
+  deposits           Deposit[]
+  withdrawals        Withdrawal[]
+  paymentOrders      PaymentOrder[]
+  merchantPayments   MerchantPayment[]
+  connectedPlatforms ConnectedPlatform[]
+  notifications      Notification[]
+  auditLogs          AuditLog[]          @relation("AuditActor")
+  merchantApplications MerchantApplication[]
+
+  @@index([role])
+  @@index([status])
+  @@map("users")
+}
+
+enum AuthTokenType {
+  EMAIL_VERIFY
+  PHONE_VERIFY
+  PASSWORD_RESET
+}
+
+/// One-time tokens (email/phone verification, password reset). Only a hash is stored.
+model AuthToken {
+  id        String          @id @default(uuid())
+  userId    String
+  type      AuthTokenType
+  tokenHash String          @unique
+  expiresAt DateTime
+  usedAt    DateTime?
+  createdAt DateTime        @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, type])
+  @@map("auth_tokens")
+}
+
+model UserProfile {
+  id          String    @id @default(uuid())
+  userId      String    @unique
+  fullName    String
+  dateOfBirth DateTime?
+  country     String    @default("RW")
+  avatarUrl   String?
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@map("user_profiles")
+}
+
+/// Digital NeS membership card (account identifier, not a Visa/Mastercard).
+model ReaderCard {
+  id         String     @id @default(uuid())
+  userId     String     @unique
+  cardNumber String     @unique
+  status     CardStatus @default(ACTIVE)
+  qrPayload  String?
+  createdAt  DateTime   @default(now())
+  updatedAt  DateTime   @updatedAt
+
+  user User @relation(fields: [userId], references: [id], onDelete: Restrict)
+
+  @@index([status])
+  @@map("reader_cards")
+}
+
+// ───────────────────────── Wallet & Ledger ─────────────────────────
+
+/// Wallet is a read-model. The ledger is the source of truth.
+/// `availableNes` / `pendingNes` are cache columns, only ever changed
+/// inside the same DB transaction that writes ledger entries, and
+/// verified by reconciliation.
+model Wallet {
+  id           String   @id @default(uuid())
+  userId       String   @unique
+  currency     String   @default("NES")
+  availableNes BigInt   @default(0)
+  pendingNes   BigInt   @default(0)
+  restrictedNes BigInt  @default(0)
+  version      Int      @default(0) // optimistic concurrency
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  user          User           @relation(fields: [userId], references: [id], onDelete: Restrict)
+  ledgerAccounts LedgerAccount[]
+
+  @@map("wallets")
+}
+
+model LedgerAccount {
+  id        String            @id @default(uuid())
+  type      LedgerAccountType
+  /// Singleton platform accounts (float, fees, adjustments, withdrawal reserve) are found by this key.
+  systemKey String?           @unique
+  /// A wallet has one USER_WALLET and one USER_PENDING account.
+  walletId  String?
+  merchantAccountId String?   @unique
+  name      String
+  createdAt DateTime          @default(now())
+
+  wallet          Wallet?          @relation(fields: [walletId], references: [id], onDelete: Restrict)
+  merchantAccount MerchantAccount? @relation(fields: [merchantAccountId], references: [id], onDelete: Restrict)
+  entries         LedgerEntry[]
+
+  @@unique([walletId, type])
+  @@index([type])
+  @@map("ledger_accounts")
+}
+
+/// Immutable. Application must never UPDATE/DELETE (enforced by DB trigger in migration).
+model LedgerTransaction {
+  id             String       @id @default(uuid())
+  reference      String       @unique
+  idempotencyKey String?      @unique
+  type           LedgerTxType
+  description    String?
+  /// RWF per NeS at the time of the transaction (e.g. 20).
+  conversionRate Int
+  metadata       Json?
+  createdByActor String?
+  createdAt      DateTime     @default(now())
+
+  entries LedgerEntry[]
+
+  @@index([type, createdAt])
+  @@map("ledger_transactions")
+}
+
+/// Immutable. Per transaction: sum(DEBIT) must equal sum(CREDIT).
+model LedgerEntry {
+  id            String         @id @default(uuid())
+  transactionId String
+  accountId     String
+  direction     EntryDirection
+  amountNes     BigInt
+  createdAt     DateTime       @default(now())
+
+  transaction LedgerTransaction @relation(fields: [transactionId], references: [id], onDelete: Restrict)
+  account     LedgerAccount     @relation(fields: [accountId], references: [id], onDelete: Restrict)
+
+  @@index([transactionId])
+  @@index([accountId, createdAt])
+  @@map("ledger_entries")
+}
+
+// ───────────────────────── Deposits / Withdrawals ─────────────────────────
+
+model Deposit {
+  id               String        @id @default(uuid())
+  userId           String
+  reference        String        @unique
+  idempotencyKey   String        @unique
+  amountRwf        BigInt
+  amountNes        BigInt
+  conversionRate   Int
+  provider         String        // PawaPay correspondent/provider code
+  phoneNumber      String
+  status           PaymentStatus @default(PENDING)
+  environment      Environment   @default(SANDBOX)
+  providerDepositId String       @unique // UUID we send to PawaPay as depositId
+  providerStatus   String?
+  failureReason    String?
+  ledgerTransactionId String?    @unique
+  createdAt        DateTime      @default(now())
+  updatedAt        DateTime      @updatedAt
+  completedAt      DateTime?
+
+  user User @relation(fields: [userId], references: [id], onDelete: Restrict)
+
+  @@index([userId, createdAt])
+  @@index([status])
+  @@map("deposits")
+}
+
+model Withdrawal {
+  id               String        @id @default(uuid())
+  userId           String
+  reference        String        @unique
+  idempotencyKey   String        @unique
+  amountNes        BigInt
+  amountRwf        BigInt
+  feeNes           BigInt        @default(0)
+  conversionRate   Int
+  provider         String
+  phoneNumber      String
+  status           PaymentStatus @default(PENDING)
+  environment      Environment   @default(SANDBOX)
+  providerPayoutId String        @unique
+  providerStatus   String?
+  failureReason    String?
+  reserveLedgerTxId  String?     @unique
+  finalLedgerTxId    String?     @unique
+  createdAt        DateTime      @default(now())
+  updatedAt        DateTime      @updatedAt
+  completedAt      DateTime?
+
+  user User @relation(fields: [userId], references: [id], onDelete: Restrict)
+
+  @@index([userId, createdAt])
+  @@index([status])
+  @@map("withdrawals")
+}
+
+// ───────────────────────── Merchants & Payments ─────────────────────────
+
+/// A payment order created before money moves (internal NeS payments).
+model PaymentOrder {
+  id             String        @id @default(uuid())
+  reference      String        @unique
+  userId         String
+  appId          String
+  amountNes      BigInt
+  description    String?
+  status         PaymentStatus @default(PENDING)
+  expiresAt      DateTime?
+  metadata       Json?
+  createdAt      DateTime      @default(now())
+  updatedAt      DateTime      @updatedAt
+
+  user    User             @relation(fields: [userId], references: [id], onDelete: Restrict)
+  app     DeveloperApp     @relation(fields: [appId], references: [id], onDelete: Restrict)
+  payment MerchantPayment?
+
+  @@index([userId])
+  @@index([appId, status])
+  @@map("payment_orders")
+}
+
+model MerchantApplication {
+  id          String         @id @default(uuid())
+  userId      String
+  appId       String?
+  businessName String
+  businessType String?
+  registrationNumber String?
+  contactEmail String
+  websiteUrl  String?
+  status      MerchantStatus @default(PENDING)
+  reviewedById String?
+  reviewNote  String?
+  createdAt   DateTime       @default(now())
+  updatedAt   DateTime       @updatedAt
+  reviewedAt  DateTime?
+
+  user User @relation(fields: [userId], references: [id], onDelete: Restrict)
+  merchantAccount MerchantAccount?
+
+  @@index([status])
+  @@map("merchant_applications")
+}
+
+/// Created on approval. Holds the merchant NeS settlement balance.
+model MerchantAccount {
+  id            String         @id @default(uuid())
+  applicationId String         @unique
+  appId         String         @unique
+  name          String
+  status        MerchantStatus @default(APPROVED)
+  settlementNes BigInt         @default(0)
+  version       Int            @default(0)
+  createdAt     DateTime       @default(now())
+  updatedAt     DateTime       @updatedAt
+
+  application   MerchantApplication @relation(fields: [applicationId], references: [id], onDelete: Restrict)
+  app           DeveloperApp        @relation(fields: [appId], references: [id], onDelete: Restrict)
+  ledgerAccount LedgerAccount?
+  payments      MerchantPayment[]
+
+  @@map("merchant_accounts")
+}
+
+model MerchantPayment {
+  id               String        @id @default(uuid())
+  reference        String        @unique
+  idempotencyKey   String
+  merchantAccountId String
+  userId           String
+  orderId          String?       @unique
+  amountNes        BigInt
+  refundedNes      BigInt        @default(0)
+  status           PaymentStatus @default(PENDING)
+  environment      Environment   @default(SANDBOX)
+  description      String?
+  ledgerTransactionId String?    @unique
+  createdAt        DateTime      @default(now())
+  updatedAt        DateTime      @updatedAt
+  completedAt      DateTime?
+
+  merchantAccount MerchantAccount @relation(fields: [merchantAccountId], references: [id], onDelete: Restrict)
+  user            User            @relation(fields: [userId], references: [id], onDelete: Restrict)
+  order           PaymentOrder?   @relation(fields: [orderId], references: [id], onDelete: Restrict)
+  refunds         Refund[]
+
+  // idempotency is scoped per merchant
+  @@unique([merchantAccountId, idempotencyKey])
+  @@index([userId, createdAt])
+  @@index([merchantAccountId, createdAt])
+  @@index([status])
+  @@map("merchant_payments")
+}
+
+model Refund {
+  id             String       @id @default(uuid())
+  reference      String       @unique
+  paymentId      String
+  idempotencyKey String
+  amountNes      BigInt
+  reason         String?
+  status         RefundStatus @default(PENDING)
+  ledgerTransactionId String? @unique
+  createdAt      DateTime     @default(now())
+  completedAt    DateTime?
+
+  payment MerchantPayment @relation(fields: [paymentId], references: [id], onDelete: Restrict)
+
+  @@unique([paymentId, idempotencyKey])
+  @@index([paymentId])
+  @@map("refunds")
+}
+
+// ───────────────────────── Developers & API ─────────────────────────
+
+model Developer {
+  id          String   @id @default(uuid())
+  userId      String   @unique
+  companyName String?
+  websiteUrl  String?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  user User         @relation(fields: [userId], references: [id], onDelete: Restrict)
+  apps DeveloperApp[]
+
+  @@map("developers")
+}
+
+model DeveloperApp {
+  id               String                 @id @default(uuid())
+  developerId      String
+  name             String
+  description      String?
+  environment      Environment            @default(SANDBOX)
+  status           AppStatus              @default(ACTIVE)
+  permissions      String[]               // e.g. payments:create, payments:read, refunds:create
+  productionAccess ProductionAccessStatus @default(NONE)
+  createdAt        DateTime               @default(now())
+  updatedAt        DateTime               @updatedAt
+
+  developer          Developer           @relation(fields: [developerId], references: [id], onDelete: Restrict)
+  apiKeys            ApiKey[]
+  webhooks           Webhook[]
+  apiLogs            ApiLog[]
+  paymentOrders      PaymentOrder[]
+  merchantAccount    MerchantAccount?
+  connectedPlatforms ConnectedPlatform[]
+
+  @@index([developerId])
+  @@index([status])
+  @@map("developer_apps")
+}
+
+/// Secrets are never stored: only a peppered hash plus a short visible prefix.
+model ApiKey {
+  id          String       @id @default(uuid())
+  appId       String
+  name        String
+  prefix      String       @unique // e.g. nes_test_ab12cd34 (public identifier)
+  secretHash  String
+  environment Environment  @default(SANDBOX)
+  status      ApiKeyStatus @default(ACTIVE)
+  lastUsedAt  DateTime?
+  createdAt   DateTime     @default(now())
+  revokedAt   DateTime?
+
+  app DeveloperApp @relation(fields: [appId], references: [id], onDelete: Cascade)
+
+  @@index([appId, status])
+  @@map("api_keys")
+}
+
+model ApiLog {
+  id         String   @id @default(uuid())
+  appId      String?
+  apiKeyId   String?
+  method     String
+  path       String
+  statusCode Int
+  durationMs Int
+  ip         String?
+  errorCode  String?
+  errorMessage String?
+  createdAt  DateTime @default(now())
+
+  app DeveloperApp? @relation(fields: [appId], references: [id], onDelete: SetNull)
+
+  @@index([appId, createdAt])
+  @@index([statusCode])
+  @@map("api_logs")
+}
+
+model Webhook {
+  id         String   @id @default(uuid())
+  appId      String
+  url        String
+  events     String[]
+  secretHash String   // signing secret shown once; stored hashed reference
+  signingKeyEnc String // encrypted signing key used to sign outbound payloads
+  active     Boolean  @default(true)
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+
+  app        DeveloperApp      @relation(fields: [appId], references: [id], onDelete: Cascade)
+  deliveries WebhookDelivery[]
+
+  @@index([appId])
+  @@map("webhooks")
+}
+
+model WebhookDelivery {
+  id           String                @id @default(uuid())
+  webhookId    String
+  event        String
+  payload      Json
+  status       WebhookDeliveryStatus @default(PENDING)
+  attempts     Int                   @default(0)
+  lastStatusCode Int?
+  lastError    String?
+  nextAttemptAt DateTime?
+  deliveredAt  DateTime?
+  createdAt    DateTime              @default(now())
+
+  webhook Webhook @relation(fields: [webhookId], references: [id], onDelete: Cascade)
+
+  @@index([webhookId, createdAt])
+  @@index([status, nextAttemptAt])
+  @@map("webhook_deliveries")
+}
+
+/// Which third-party platforms a user has authorized to charge their wallet.
+model ConnectedPlatform {
+  id           String    @id @default(uuid())
+  userId       String
+  appId        String
+  /// Optional per-platform spending cap in NeS.
+  spendLimitNes BigInt?
+  active       Boolean   @default(true)
+  connectedAt  DateTime  @default(now())
+  revokedAt    DateTime?
+
+  user User         @relation(fields: [userId], references: [id], onDelete: Cascade)
+  app  DeveloperApp @relation(fields: [appId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, appId])
+  @@map("connected_platforms")
+}
+
+// ───────────────────────── Platform ─────────────────────────
+
+/// Append-only. Application must never UPDATE/DELETE.
+model AuditLog {
+  id         String   @id @default(uuid())
+  actorId    String?
+  action     String
+  entityType String
+  entityId   String?
+  before     Json?
+  after      Json?
+  ip         String?
+  userAgent  String?
+  createdAt  DateTime @default(now())
+
+  actor User? @relation("AuditActor", fields: [actorId], references: [id], onDelete: SetNull)
+
+  @@index([actorId, createdAt])
+  @@index([entityType, entityId])
+  @@index([action])
+  @@map("audit_logs")
+}
+
+model SystemSetting {
+  key         String   @id
+  value       Json
+  description String?
+  updatedById String?
+  updatedAt   DateTime @updatedAt
+
+  @@map("system_settings")
+}
+
+model Notification {
+  id        String    @id @default(uuid())
+  userId    String
+  type      String
+  title     String
+  body      String
+  readAt    DateTime?
+  createdAt DateTime  @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, readAt])
+  @@map("notifications")
+}
